@@ -1,0 +1,254 @@
+// Prisma schema for the Usiquimica INP (Introdução de Novo Produto) workflow tool.
+// Target: Postgres (Neon), deployed on Vercel.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Area {
+  SOLICITANTE
+  QUALIDADE
+  MARKETING
+  LABORATORIO
+  ESPECIALISTA_PRODUTO
+  FABRICA
+  CONTROLADORIA
+  DIRETORIA_COMERCIAL
+}
+
+enum IniciativaStatus {
+  ABERTA
+  CONCLUIDA
+  CANCELADA
+}
+
+enum StepStatus {
+  EM_ANDAMENTO
+  CONCLUIDA
+}
+
+enum GateDecision {
+  GO
+  HOLD
+  NO_GO
+}
+
+enum EmailType {
+  TRANSICAO
+  DIA4
+  VENCIDA
+}
+
+// ---------------------------------------------------------------------------
+// Users & areas
+// ---------------------------------------------------------------------------
+
+model User {
+  id                 String   @id @default(cuid())
+  name               String
+  email              String   @unique
+  passwordHash       String
+  isAdmin            Boolean  @default(false)
+  active             Boolean  @default(true)
+  mustChangePassword Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  areas               UserArea[]
+  iniciativasSolicitadas Iniciativa[]      @relation("Requester")
+  stepInstancesAssigned  StepInstance[]    @relation("Assignee")
+  stepInstancesCompleted StepInstance[]    @relation("Completer")
+  comments               Comment[]
+  attachments            Attachment[]
+  auditLogs              AuditLog[]
+
+  @@index([email])
+}
+
+model UserArea {
+  id       String   @id @default(cuid())
+  userId   String
+  areaId   Area
+  isBackup Boolean  @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, areaId])
+  @@index([areaId])
+}
+
+// ---------------------------------------------------------------------------
+// Workflow definition
+// ---------------------------------------------------------------------------
+
+model StepDefinition {
+  id              String  @id @default(cuid())
+  order           Int? // null for special/off-sequence steps (e.g. Amostras)
+  phase           Int? // 1, 2 or 3; null for off-sequence steps
+  key             String  @unique
+  label           String
+  area            Area
+  slaBusinessDays Int     @default(3)
+  isGate          Boolean @default(false)
+  parallelGroup   String? // steps sharing iniciativaId + parallelGroup gate the next step
+
+  stepInstances StepInstance[]
+
+  @@index([order])
+}
+
+// ---------------------------------------------------------------------------
+// Iniciativas (INP records)
+// ---------------------------------------------------------------------------
+
+model Iniciativa {
+  id          String           @id @default(cuid())
+  code        String           @unique // e.g. INP-2026-001
+  productName String
+  requesterId String
+  status      IniciativaStatus @default(ABERTA)
+  createdAt   DateTime         @default(now())
+  closedAt    DateTime?
+
+  // Free-form JSON payloads capturing the source-spreadsheet fields.
+  // See src/lib/formFields.ts for the typed field configs used to render/edit these.
+  fase1Data     Json?
+  fase2Data     Json?
+  cadastroData  Json?
+  amostraData   Json?
+
+  requester User @relation("Requester", fields: [requesterId], references: [id])
+
+  stepInstances StepInstance[]
+  comments      Comment[]
+  attachments   Attachment[]
+  auditLogs     AuditLog[]
+  emailLogs     EmailLog[]
+
+  @@index([status])
+  @@index([requesterId])
+}
+
+model StepInstance {
+  id               String     @id @default(cuid())
+  iniciativaId     String
+  stepDefinitionId String
+  status           StepStatus @default(EM_ANDAMENTO)
+  assignedUserId   String?
+  startedAt        DateTime   @default(now())
+  dueAt            DateTime?
+  completedAt      DateTime?
+  completedById    String?
+
+  // Gate-only fields (F1_GATE1)
+  decision     GateDecision?
+  decisionNote String?
+
+  // Optional structured payload for steps that capture data beyond "mark done"
+  data Json?
+
+  day4NotifiedAt       DateTime?
+  lastOverdueNotifiedAt DateTime?
+
+  iniciativa     Iniciativa     @relation(fields: [iniciativaId], references: [id], onDelete: Cascade)
+  stepDefinition StepDefinition @relation(fields: [stepDefinitionId], references: [id])
+  assignee       User?          @relation("Assignee", fields: [assignedUserId], references: [id])
+  completedBy    User?          @relation("Completer", fields: [completedById], references: [id])
+
+  comments    Comment[]
+  attachments Attachment[]
+
+  @@index([iniciativaId])
+  @@index([status])
+  @@index([assignedUserId])
+}
+
+// ---------------------------------------------------------------------------
+// Collaboration: comments, attachments, audit log, email log
+// ---------------------------------------------------------------------------
+
+model Comment {
+  id             String   @id @default(cuid())
+  stepInstanceId String
+  iniciativaId   String
+  userId         String
+  text           String
+  createdAt      DateTime @default(now())
+
+  stepInstance StepInstance @relation(fields: [stepInstanceId], references: [id], onDelete: Cascade)
+  iniciativa   Iniciativa   @relation(fields: [iniciativaId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@index([stepInstanceId])
+  @@index([iniciativaId])
+}
+
+model Attachment {
+  id             String   @id @default(cuid())
+  iniciativaId   String
+  stepInstanceId String?
+  uploadedById   String
+  fileName       String
+  blobUrl        String
+  size           Int
+  mimeType       String
+  createdAt      DateTime @default(now())
+
+  iniciativa   Iniciativa    @relation(fields: [iniciativaId], references: [id], onDelete: Cascade)
+  stepInstance StepInstance? @relation(fields: [stepInstanceId], references: [id], onDelete: SetNull)
+  uploadedBy   User          @relation(fields: [uploadedById], references: [id])
+
+  @@index([iniciativaId])
+  @@index([stepInstanceId])
+}
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  iniciativaId String
+  userId       String?
+  action       String // human-readable machine key, e.g. "STEP_CONCLUIDA"
+  details      String? // human-readable pt-BR description
+  createdAt    DateTime @default(now())
+
+  iniciativa Iniciativa @relation(fields: [iniciativaId], references: [id], onDelete: Cascade)
+  user       User?      @relation(fields: [userId], references: [id])
+
+  @@index([iniciativaId])
+}
+
+model EmailLog {
+  id             String    @id @default(cuid())
+  iniciativaId   String
+  stepInstanceId String?
+  type           EmailType
+  recipients     Json
+  subject        String
+  sentAt         DateTime  @default(now())
+  success        Boolean
+  error          String?
+
+  iniciativa Iniciativa @relation(fields: [iniciativaId], references: [id], onDelete: Cascade)
+
+  @@index([iniciativaId])
+}
+
+// ---------------------------------------------------------------------------
+// Holidays (for business-day calculations)
+// ---------------------------------------------------------------------------
+
+model Holiday {
+  id          String   @id @default(cuid())
+  date        DateTime @db.Date
+  description String
+
+  @@unique([date])
+}
